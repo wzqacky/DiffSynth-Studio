@@ -10,7 +10,7 @@ export HF_ENDPOINT="https://hf-mirror.com/"
 
 # Dataset paths
 DATASET_BASE=data/inpaint_dataset_resized
-METADATA_CSV=data/inpaint_dataset_resized/metadata.csv
+METADATA_CSV=data/inpaint_dataset_resized/metadata_reference_mask.csv # use the csv with reference mask path added
 
 # Training parameters
 LEARNING_RATE=1e-4
@@ -19,7 +19,7 @@ LORA_RANK=32
 GRADIENT_ACCUM=4
 
 # Output path
-MODEL_NAME="Wan2.1-T2V-1.3B-InpaintRef-dinov2"
+MODEL_NAME="Wan2.1-T2V-1.3B-InpaintRef-hfmap-dinov2"
 OUTPUT_PATH="./models/train/${MODEL_NAME}"
 
 echo "=========================================="
@@ -38,7 +38,7 @@ accelerate launch \
   examples/wanvideo/model_training/train.py \
   --dataset_base_path "${DATASET_BASE}" \
   --dataset_metadata_path "${METADATA_CSV}" \
-  --data_file_keys "video,source_video,mask,reference_image" \
+  --data_file_keys "video,source_video,mask,reference_image,reference_mask" \
   --dataset_repeat 100 \
   --model_id_with_origin_paths "Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-T2V-1.3B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-T2V-1.3B:Wan2.1_VAE.pth,Wan-AI/Wan2.1-I2V-14B-480P:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
   --learning_rate ${LEARNING_RATE} \
@@ -48,7 +48,8 @@ accelerate launch \
   --lora_base_model "dit" \
   --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
   --lora_rank ${LORA_RANK} \
-  --extra_inputs "source_video,inpaint_mask,reference_image" \
+  --extra_inputs "source_video,inpaint_mask,reference_image,reference_mask" \
+  --use_hf_map \
   --use_inpaint_concat \
   --use_ref_conv \
   --use_img_emb \
