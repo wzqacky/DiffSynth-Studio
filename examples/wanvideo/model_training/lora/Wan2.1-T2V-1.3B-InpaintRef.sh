@@ -6,6 +6,7 @@ source /data/Anaconda3/etc/profile.d/conda.sh
 conda activate diffsynth
 
 export CUDA_VISIBLE_DEVICES="6"
+export HF_ENDPOINT="https://hf-mirror.com/"
 
 # Dataset paths
 DATASET_BASE=data/inpaint_dataset_resized
@@ -18,7 +19,7 @@ LORA_RANK=32
 GRADIENT_ACCUM=4
 
 # Output path
-MODEL_NAME="Wan2.1-T2V-1.3B-InpaintRef"
+MODEL_NAME="Wan2.1-T2V-1.3B-InpaintRef-dinov2"
 OUTPUT_PATH="./models/train/${MODEL_NAME}"
 
 echo "=========================================="
@@ -51,6 +52,7 @@ accelerate launch \
   --use_inpaint_concat \
   --use_ref_conv \
   --use_img_emb \
+  --image_encoder_type dinov2 \
   --use_gradient_checkpointing_offload \
   --tracker "tensorboard" \
   --tracker_project_name "${MODEL_NAME}" \
