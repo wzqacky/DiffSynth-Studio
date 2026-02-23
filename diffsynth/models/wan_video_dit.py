@@ -5,7 +5,6 @@ import math
 from typing import Tuple, Optional
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
-from ..core.gradient import gradient_checkpoint_forward
 
 try:
     import flash_attn_interface
@@ -94,7 +93,7 @@ def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    freqs = freqs.to(torch.complex64) if freqs.device.type == "npu" else freqs
+    freqs = freqs.to(torch.complex64) if freqs.device == "npu" else freqs
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
     return x_out.to(x.dtype)
 
@@ -169,11 +168,13 @@ class CrossAttention(nn.Module):
             self.norm_k_img = RMSNorm(dim, eps=eps)
             
         self.attn = AttentionModule(self.num_heads)
+        # Vary when using PerceiverResampler (num_latents=64)
+        self.num_image_tokens = 257
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
         if self.has_image_input:
-            img = y[:, :257]
-            ctx = y[:, 257:]
+            img = y[:, :self.num_image_tokens]
+            ctx = y[:, self.num_image_tokens:]
         else:
             ctx = y
         q = self.norm_q(self.q(x))
@@ -250,6 +251,88 @@ class MLP(torch.nn.Module):
         if self.has_pos_emb:
             x = x + self.emb_pos.to(dtype=x.dtype, device=x.device)
         return self.proj(x)
+
+
+class PerceiverResampler(torch.nn.Module):
+    """Learned cross-attention bottleneck that compresses CLIP/DINOv2 patch tokens
+    (B, 257, clip_dim) → (B, num_latents, dim).
+
+    - num_latents << 257, reducing KV cost in every DiT cross-attention block.
+    - More flexible than applying MLP for every latent in image embedding.
+    - Zero-initialises the output LayerNorm weight so the module contributes
+      nothing at the start of training (safe warm-start).
+    """
+
+    def __init__(self, clip_dim: int, dim: int, num_latents: int = 64,
+                 num_heads: int = 8, num_layers: int = 4):
+        super().__init__()
+        self.latents = nn.Parameter(torch.randn(num_latents, dim) * 0.02)
+        self.input_proj = nn.Linear(clip_dim, dim)
+        self.norm_in = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "norm_q":  nn.LayerNorm(dim),
+                "norm_kv": nn.LayerNorm(dim),
+                "attn":    nn.MultiheadAttention(dim, num_heads, batch_first=True),
+                "ff_norm": nn.LayerNorm(dim),
+                "ff":      nn.Sequential(
+                    nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
+                ),
+            })
+            for _ in range(num_layers)
+        ])
+        self.out_norm = nn.LayerNorm(dim)
+        # Zero-init output norm weight → zero contribution at step 0
+        nn.init.zeros_(self.out_norm.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, clip_dim)
+        B = x.shape[0]
+        x = self.norm_in(self.input_proj(x))                       # (B, N, dim)
+        q = self.latents.unsqueeze(0).expand(B, -1, -1).clone()    # (B, num_latents, dim)
+        for layer in self.layers:
+            q_n = layer["norm_q"](q)
+            kv  = layer["norm_kv"](x)
+            q   = q + layer["attn"](q_n, kv, kv)[0]               # cross-attn residual
+            q   = q + layer["ff"](layer["ff_norm"](q))             # FFN residual
+        return self.out_norm(q)                                     # (B, num_latents, dim)
+
+
+class HFMapEncoder(torch.nn.Module):
+    """Pixel-space high-frequency detail map encoder.
+
+    - Applies 4 stride-2 convolutions (16x spatial downsample, 16x cahnnel expansion) followed by a
+    1x1 projection to `out_dim`.  
+    - The projection is zero-initialised so the HF-Map contributes nothing at the start of training.
+    """
+
+    def __init__(self, out_dim):
+        super().__init__()
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 64, 3, stride=2, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(128, 256, 3, stride=2, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(256, 512, 3, stride=2, padding=1),
+            torch.nn.SiLU(),
+        )
+        self.proj = torch.nn.Conv2d(512, out_dim, 1)
+        torch.nn.init.zeros_(self.proj.weight)
+        torch.nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x):
+        """
+        Parameters
+        x : Tensor
+            (B, 3, H, W) pixel-space HF-Map in [0, 1].
+
+        Returns
+        Tensor
+            (B, out_dim, H/16, W/16)
+        """
+        return self.proj(self.encoder(x))
 
 
 class Head(nn.Module):
@@ -380,15 +463,27 @@ class WanModel(torch.nn.Module):
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(*inputs)
+            return custom_forward
 
         for block in self.blocks:
-            if self.training:
-                x = gradient_checkpoint_forward(
-                    block,
-                    use_gradient_checkpointing,
-                    use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
-                )
+            if self.training and use_gradient_checkpointing:
+                if use_gradient_checkpointing_offload:
+                    with torch.autograd.graph.save_on_cpu():
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x, context, t_mod, freqs,
+                            use_reentrant=False,
+                        )
+                else:
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        x, context, t_mod, freqs,
+                        use_reentrant=False,
+                    )
             else:
                 x = block(x, context, t_mod, freqs)
 

@@ -1,13 +1,11 @@
 import torch, types
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from einops import repeat
+from einops import repeat, rearrange
 from typing import Optional, Union
-from einops import rearrange
-import numpy as np
-from PIL import Image
+import cv2
 from tqdm import tqdm
-from typing import Optional
 from typing_extensions import Literal
 from transformers import Wav2Vec2Processor
 
@@ -63,6 +61,8 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_ImageEmbedderFused(),
             WanVideoUnit_FunControl(),
             WanVideoUnit_FunReference(),
+            WanVideoUnit_HFMap(),
+            WanVideoUnit_InpaintConcat(),
             WanVideoUnit_FunCameraControl(),
             WanVideoUnit_SpeedControl(),
             WanVideoUnit_VACE(),
@@ -83,6 +83,9 @@ class WanVideoPipeline(BasePipeline):
 
 
     def enable_usp(self):
+        """
+        Enable Unified Sequence Parallel for DiT
+        """
         from ..utils.xfuser import get_sequence_parallel_world_size, usp_attn_forward, usp_dit_forward
 
         for block in self.dit.blocks:
@@ -107,6 +110,11 @@ class WanVideoPipeline(BasePipeline):
         use_usp: bool = False,
         vram_limit: float = None,
     ):
+        """
+        Primary entry point for intiailizing the pipeline, separating the role of __init__ and from_pretrained()
+            - __init__(): creates a blank instance of the pipeline, i.e. initializes all the necessary attributes (dit, vae, text_encoders, ...)
+            - from_pretrained(): performs all steps to create a fully-configured and ready-to-use pipeline instance => downloading, loading weights, ...
+        """
         # Redirect model path
         if redirect_common_files:
             redirect_dict = {
@@ -187,6 +195,12 @@ class WanVideoPipeline(BasePipeline):
         # Video-to-video
         input_video: Optional[list[Image.Image]] = None,
         denoising_strength: Optional[float] = 1.0,
+
+        # New input parameters for the masked video recover pipeline
+        source_video: Optional[list[Image.Image]] = None,
+        inpaint_mask: Optional[list[Image.Image]] = None,
+        reference_mask: Optional[Image.Image] = None,
+    
         # Speech-to-video
         input_audio: Optional[np.array] = None,
         audio_embeds: Optional[torch.Tensor] = None,
@@ -266,7 +280,14 @@ class WanVideoPipeline(BasePipeline):
             "input_image": input_image,
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
-            "control_video": control_video, "reference_image": reference_image,
+            "control_video": control_video,
+
+            # Required for the mask video recover pipeline
+            "source_video": source_video,
+            "inpaint_mask": inpaint_mask,
+            "reference_image": reference_image,
+            "reference_mask": reference_mask,
+
             "camera_control_direction": camera_control_direction, "camera_control_speed": camera_control_speed, "camera_control_origin": camera_control_origin,
             "vace_video": vace_video, "vace_video_mask": vace_video_mask, "vace_reference_image": vace_reference_image, "vace_scale": vace_scale,
             "seed": seed, "rand_device": rand_device,
@@ -532,7 +553,7 @@ class WanVideoUnit_FunControl(PipelineUnit):
 class WanVideoUnit_FunReference(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("reference_image", "height", "width", "reference_image"),
+            input_params=("reference_image", "height", "width"),
             output_params=("reference_latents", "clip_feature"),
             onload_model_names=("vae", "image_encoder")
         )
@@ -541,6 +562,9 @@ class WanVideoUnit_FunReference(PipelineUnit):
         if reference_image is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
+        # NOTE: Comment the resize if wanna test with arbitrary resolution reference image
+        # TODO: Currently, reference image must be resized, else rotary emb will encounter spatial dimension mismatch
+        # TODO: My thought is if resizing would harm the ratio, then it probably will degrade the performance
         reference_image = reference_image.resize((width, height))
         reference_latents = pipe.preprocess_video([reference_image])
         reference_latents = pipe.vae.encode(reference_latents, device=pipe.device)
@@ -549,6 +573,113 @@ class WanVideoUnit_FunReference(PipelineUnit):
         clip_feature = pipe.preprocess_image(reference_image)
         clip_feature = pipe.image_encoder.encode_image([clip_feature])
         return {"reference_latents": reference_latents, "clip_feature": clip_feature}
+
+
+def compute_hf_map(image, mask=None, thresh=50):
+    """Compute a high-frequency detail map from a PIL Image using Sobel edges.
+
+    Parameters
+    image : PIL.Image
+        Reference image (RGB).
+    mask : PIL.Image or None
+        Optional object mask.  When provided the mask is eroded to strip
+        segmentation-boundary edges before Sobel filtering.
+    thresh : int
+        Edge magnitude values below this are zeroed out.
+
+    Returns
+    numpy.ndarray
+        (H, W, 3) edge-weighted colour map.
+    """
+    img = np.array(image.convert("RGB"))  # (H, W, 3) uint8
+
+    if mask is not None: # Eroded mask for ignoring outline shape of the product
+        mask_np = np.array(mask.convert("L"))  # (H, W) uint8
+        mask_np = (mask_np > 127).astype(np.uint8)
+        kernel = np.ones((5, 5), np.uint8)
+        mask_np = cv2.erode(mask_np, kernel, iterations=2)
+    else:
+        mask_np = None
+
+    sobelx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+    sobel_x = cv2.convertScaleAbs(sobelx)
+    sobel_y = cv2.convertScaleAbs(sobely)
+    edges = cv2.addWeighted(sobel_x, 0.5, sobel_y, 0.5, 0)
+
+    edge_mag = np.max(edges, axis=-1)  # (H, W)
+    if mask_np is not None:
+        edge_mag = edge_mag * mask_np
+    edge_mag[edge_mag < thresh] = 0.0
+
+    edge_3ch = np.stack([edge_mag] * 3, axis=-1)
+    hf_map = (edge_3ch.astype(np.float32) / 255.0 * img.astype(np.float32)).astype(np.uint8)
+    return hf_map
+
+
+class WanVideoUnit_HFMap(PipelineUnit):
+    """Compute a pixel-space high-frequency detail map from the reference image."""
+
+    def __init__(self):
+        super().__init__(
+            input_params=("reference_image", "reference_mask", "height", "width"),
+            output_params=("hf_map",),
+        )
+
+    def process(self, pipe: "WanVideoPipeline", reference_image, reference_mask, height, width):
+        if reference_image is None or reference_mask is None:
+            return {}
+        hf_np = compute_hf_map(reference_image, mask=reference_mask)
+        hf_tensor = torch.from_numpy(hf_np).float().permute(2, 0, 1) / 255.0  # (3, H, W)
+        hf_tensor = F.interpolate(
+            hf_tensor.unsqueeze(0), size=(height, width),
+            mode="bilinear", align_corners=False,
+        )  # (1, 3, H_vid, W_vid)
+        return {"hf_map": hf_tensor}
+
+
+class WanVideoUnit_InpaintConcat(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            input_params=("source_video", "inpaint_mask", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride"),
+            output_params=("y",),
+            onload_model_names=("vae",)
+        )
+
+    def process(self, pipe: WanVideoPipeline, source_video, inpaint_mask, num_frames, height, width, tiled, tile_size, tile_stride):
+        if source_video is None:
+            return {}
+        pipe.load_models_to_device(self.onload_model_names)
+
+        # VAE-encode the masked source video
+        source_video = pipe.preprocess_video(source_video)
+        source_latents = pipe.vae.encode(
+            source_video, device=pipe.device,
+            tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
+        ).to(dtype=pipe.torch_dtype, device=pipe.device)
+        # source_latents: (1, 16, T', H/8, W/8)
+
+        # Downsample mask to latent spatial resolution
+        if inpaint_mask is not None:
+            mask = pipe.preprocess_video(inpaint_mask, min_value=0, max_value=1)
+            # mask: (1, 3, T, H, W) → take one channel
+            mask = mask[:, :1]  # (1, 1, T, H, W)
+            mask_latents = torch.nn.functional.interpolate(
+                mask,
+                size=(source_latents.shape[2], source_latents.shape[3], source_latents.shape[4]),
+                mode='nearest'
+            ).to(dtype=pipe.torch_dtype, device=pipe.device)
+            # mask_latents: (1, 1, T', H/8, W/8)
+        else:
+            # No mask provided → assume entire frame is inpaint region
+            mask_latents = torch.ones(
+                1, 1, source_latents.shape[2], source_latents.shape[3], source_latents.shape[4],
+                dtype=pipe.torch_dtype, device=pipe.device
+            )
+
+        y = torch.cat([source_latents, mask_latents], dim=1)
+        # y: (1, 17, T', H/8, W/8)
+        return {"y": y}
 
 
 
@@ -647,16 +778,16 @@ class WanVideoUnit_VACE(PipelineUnit):
             
             inactive = vace_video * (1 - vace_video_mask) + 0 * vace_video_mask
             reactive = vace_video * vace_video_mask + 0 * (1 - vace_video_mask)
-            inactive = pipe.vae.encode(inactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
-            reactive = pipe.vae.encode(reactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
-            vace_video_latents = torch.concat((inactive, reactive), dim=1)
+            inactive = pipe.vae.encode(inactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device) # 1, 16, T, H, W
+            reactive = pipe.vae.encode(reactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device) # 1, 16, T, H, W
+            vace_video_latents = torch.concat((inactive, reactive), dim=1) # 1, 32, T, H, W
             
-            vace_mask_latents = rearrange(vace_video_mask[0,0], "T (H P) (W Q) -> 1 (P Q) T H W", P=8, Q=8)
+            vace_mask_latents = rearrange(vace_video_mask[0,0], "T (H P) (W Q) -> 1 (P Q) T H W", P=8, Q=8) # 1, 64, T, H, W
             vace_mask_latents = torch.nn.functional.interpolate(vace_mask_latents, size=((vace_mask_latents.shape[2] + 3) // 4, vace_mask_latents.shape[3], vace_mask_latents.shape[4]), mode='nearest-exact')
             
             if vace_reference_image is None:
                 pass
-            else:
+            else: # Add reference image latent into vace_video_latents (in seq. dimension), and pad vace_mask_latents
                 if not isinstance(vace_reference_image,list):
                     vace_reference_image = [vace_reference_image]
 
@@ -675,7 +806,7 @@ class WanVideoUnit_VACE(PipelineUnit):
                 vace_video_latents = torch.concat((*vace_reference_latents, vace_video_latents), dim=2)
                 vace_mask_latents = torch.concat((torch.zeros_like(vace_mask_latents[:, :, :f]), vace_mask_latents), dim=2)
             
-            vace_context = torch.concat((vace_video_latents, vace_mask_latents), dim=1)
+            vace_context = torch.concat((vace_video_latents, vace_mask_latents), dim=1) # 1, 96, T, H, W
             return {"vace_context": vace_context, "vace_scale": vace_scale}
         else:
             return {"vace_context": None, "vace_scale": vace_scale}
@@ -1072,10 +1203,20 @@ class TeaCache:
 
 
 class TemporalTiler_BCTHW:
+    """
+    Sliding Window Temporal Tiling for processing long videos that does not fit in GPU memory all at once.
+    - Splits T dimension into overlapping windows, runs the model on each chunk, then blend the result
+
+    """
     def __init__(self):
         pass
 
     def build_1d_mask(self, length, left_bound, right_bound, border_width):
+        """ 
+        Create the blend weight for the chunk:
+        Window 1:  [1.0  1.0  1.0  1.0  0.75  0.25]
+        Window 2:  [0.25  0.75  1.0  1.0  1.0  1.0]
+        """
         x = torch.ones((length,))
         if border_width == 0:
             return x
@@ -1158,6 +1299,7 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
+    hf_map: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1221,9 +1363,10 @@ def model_fn_wan_video(
 
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+        # For Wan2.2-TI2V-5B, first frame is a clean VAE-encoded image fused directly into the latents (i.e. as the first frame)
         timestep = torch.concat([
-            torch.zeros((1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
-            torch.ones((latents.shape[2] - 1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
+            torch.zeros((1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device), # first frame: t=0 (clean)
+            torch.ones((latents.shape[2] - 1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep # remaining: t=actual
         ]).flatten()
         t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0))
         if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
@@ -1249,9 +1392,13 @@ def model_fn_wan_video(
 
     # Image Embedding
     if y is not None and dit.require_vae_embedding:
-        x = torch.cat([x, y], dim=1)
+        x = torch.cat([x, y], dim=1) # concat. along channel dim.
+
     if clip_feature is not None and dit.require_clip_embedding:
-        clip_embdding = dit.img_emb(clip_feature)
+        if hasattr(dit, 'perceiver_resampler'):
+            clip_embdding = dit.perceiver_resampler(clip_feature)  # (B, num_latents, dim) => Perceiver Resampler
+        else:
+            clip_embdding = dit.img_emb(clip_feature)              # (B, 257, dim) => MLP
         context = torch.cat([clip_embdding, context], dim=1)
         
     # Camera control
@@ -1264,13 +1411,23 @@ def model_fn_wan_video(
     # Patchify
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
-    
+
+    # High-frequency detail map (pixel-space → additive injection)
+    if hf_map is not None and hasattr(dit, 'hf_encoder'):
+        hf_features = dit.hf_encoder(hf_map.to(dtype=x.dtype, device=x.device))
+        if hf_features.shape[2:] != (h, w):
+            hf_features = F.interpolate(hf_features, size=(h, w), mode="bilinear", align_corners=False)
+        hf_features = hf_features.flatten(2).transpose(1, 2)           # (B, h*w, dim)
+        hf_features = hf_features.unsqueeze(1).expand(-1, f, -1, -1)   # (B, f, h*w, dim)
+        hf_features = hf_features.reshape(x.shape[0], f * h * w, -1)   # (B, f*h*w, dim)
+        x = x + hf_features
+
     # Reference image
-    if reference_latents is not None:
+    if reference_latents is not None and hasattr(dit, 'ref_conv'):
         if len(reference_latents.shape) == 5:
             reference_latents = reference_latents[:, :, 0]
         reference_latents = dit.ref_conv(reference_latents).flatten(2).transpose(1, 2)
-        x = torch.concat([reference_latents, x], dim=1)
+        x = torch.concat([reference_latents, x], dim=1) # concat. along seq len dim.
         f += 1
     
     freqs = torch.cat([
@@ -1305,6 +1462,7 @@ def model_fn_wan_video(
         tea_cache_update = False
         
     if vace_context is not None:
+        # VACE hints pre-computed before the main DiT block
         vace_hints = vace(
             x, vace_context, context, t_mod, freqs,
             use_gradient_checkpointing=use_gradient_checkpointing,
@@ -1321,6 +1479,11 @@ def model_fn_wan_video(
     if tea_cache_update:
         x = tea_cache.update(x)
     else:
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(*inputs)
+            return custom_forward
+        
         def create_custom_forward_vap(block, vap):
             def custom_forward(*inputs):
                 return vap(block, *inputs)
@@ -1334,24 +1497,32 @@ def model_fn_wan_video(
                         x, x_vap = torch.utils.checkpoint.checkpoint(
                             create_custom_forward_vap(block, vap),
                             x, context, t_mod, freqs, x_vap, context_vap, t_mod_vap, freqs_vap, block_id,
-                            use_reentrant=False
+                            use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x, x_vap = torch.utils.checkpoint.checkpoint(
                         create_custom_forward_vap(block, vap),
                         x, context, t_mod, freqs, x_vap, context_vap, t_mod_vap, freqs_vap, block_id,
-                        use_reentrant=False
+                        use_reentrant=False,
                     )
                 else:
                     x, x_vap = vap(block, x, context, t_mod, freqs, x_vap, context_vap, t_mod_vap, freqs_vap, block_id)
             else:
-                x = gradient_checkpoint_forward(
-                    block,
-                    use_gradient_checkpointing,
-                    use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
-                )
-              
+                if use_gradient_checkpointing_offload:
+                    with torch.autograd.graph.save_on_cpu():
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x, context, t_mod, freqs,
+                            use_reentrant=False,
+                        )
+                elif use_gradient_checkpointing:
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        x, context, t_mod, freqs,
+                        use_reentrant=False,
+                    )
+                else:
+                    x = block(x, context, t_mod, freqs)
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
@@ -1373,7 +1544,7 @@ def model_fn_wan_video(
             x = get_sp_group().all_gather(x, dim=1)
             x = x[:, :-pad_shape] if pad_shape > 0 else x
     # Remove reference latents
-    if reference_latents is not None:
+    if reference_latents is not None and hasattr(dit, 'ref_conv'):
         x = x[:, reference_latents.shape[1]:]
         f -= 1
     x = dit.unpatchify(x, (f, h, w))
@@ -1474,18 +1645,32 @@ def model_fn_wans2v(
         return custom_forward
 
     for block_id, block in enumerate(dit.blocks):
-        x = gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing,
-                use_gradient_checkpointing_offload,
-                x, context, t_mod, seq_len_x, pre_compute_freqs[0]
+        if use_gradient_checkpointing_offload:
+            with torch.autograd.graph.save_on_cpu():
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    x, context, t_mod, seq_len_x, pre_compute_freqs[0],
+                    use_reentrant=False,
+                )
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(lambda x: dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x)),
+                    x,
+                    use_reentrant=False,
+                )
+        elif use_gradient_checkpointing:
+            x = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(block),
+                x, context, t_mod, seq_len_x, pre_compute_freqs[0],
+                use_reentrant=False,
             )
-        x = gradient_checkpoint_forward(
-            lambda x: dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x),
-            use_gradient_checkpointing,
-            use_gradient_checkpointing_offload,
-            x
-        )
+            x = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(lambda x: dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x)),
+                x,
+                use_reentrant=False,
+            )
+        else:
+            x = block(x, context, t_mod, seq_len_x, pre_compute_freqs[0])
+            x = dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x_global, use_unified_sequence_parallel)
 
     if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
         x = get_sp_group().all_gather(x, dim=1)
